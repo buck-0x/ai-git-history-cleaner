@@ -43,7 +43,7 @@ def parse_args():
     parser.add_argument('--dry-run', action='store_true',
                       help='Show what would be done without making changes')
     parser.add_argument('--logical-grouping', action='store_true', default=True,
-                      help='Group commits logically based on purpose (default: True)')
+                      help='Group consecutive commits logically based on purpose (default: True)')
     parser.add_argument('--batch-size', type=int, default=100,
                       help='Maximum number of commits to process in a single API call (default: 100)')
     parser.add_argument('--verify', action='store_true', default=True,
@@ -112,6 +112,66 @@ def get_commit_messages(repo_path, count, source_branch=None, target_branch=None
         print(f"Error accessing git repository: {e}")
         sys.exit(1)
 
+def validate_consecutive_commits(groups, commits):
+    """Ensure that each group only contains consecutive commits."""
+    valid_groups = []
+    commit_indices = {sha: idx for idx, (sha, _) in enumerate(commits)}
+    
+    for group in groups:
+        # Get the indices for each commit in this group
+        indices = [commit_indices.get(sha, -1) for sha in group['commits']]
+        # Remove any invalid indices
+        indices = [idx for idx in indices if idx >= 0]
+        # Sort indices
+        indices.sort()
+        
+        # Check if indices form a consecutive sequence
+        is_consecutive = len(indices) > 0 and (max(indices) - min(indices) + 1 == len(indices))
+        
+        if is_consecutive:
+            # Group is valid, keep it
+            valid_groups.append(group)
+        else:
+            # Report issue and split into smaller consecutive groups
+            print(f"Warning: Group with message '{group['message']}' contains non-consecutive commits. Splitting.")
+            
+            # Create subgroups with consecutive commits
+            consecutive_subgroups = []
+            current_subgroup = []
+            prev_idx = None
+            
+            for sha in group['commits']:
+                idx = commit_indices.get(sha, -1)
+                if idx < 0:
+                    continue
+                
+                if prev_idx is None or idx == prev_idx + 1:
+                    # Continues the sequence
+                    current_subgroup.append(sha)
+                else:
+                    # Start a new subgroup
+                    if current_subgroup:
+                        consecutive_subgroups.append(current_subgroup)
+                    current_subgroup = [sha]
+                
+                prev_idx = idx
+            
+            # Add the last subgroup if it exists
+            if current_subgroup:
+                consecutive_subgroups.append(current_subgroup)
+            
+            # Create valid groups from the subgroups
+            for subgroup in consecutive_subgroups:
+                if len(subgroup) > 0:
+                    valid_groups.append({
+                        "message": group['message'] if len(consecutive_subgroups) == 1 else 
+                                   f"{group['message']} (part {consecutive_subgroups.index(subgroup)+1}/{len(consecutive_subgroups)})",
+                        "commits": subgroup,
+                        "commit_indices": [commit_indices.get(sha, 9999) for sha in subgroup]
+                    })
+    
+    return valid_groups
+
 def get_logical_commit_groups(commits, api_key):
     """Group commits logically based on purpose and generate squash messages for each group."""
     # Set up OpenAI API
@@ -140,22 +200,29 @@ def get_logical_commit_groups(commits, api_key):
             print(f"Processing batch {i+1}/{len(batches)} ({len(batch)} commits)...")
             batch_groups = process_commit_batch(batch, api_key)
             if batch_groups:
-                all_groups.extend(batch_groups)
+                # Validate that groups only contain consecutive commits
+                valid_batch_groups = validate_consecutive_commits(batch_groups, batch)
+                all_groups.extend(valid_batch_groups)
             else:
                 print(f"Warning: Failed to process batch {i+1}, skipping...")
         
         # Store commit indices in each group for sorting later
         for group in all_groups:
-            group['commit_indices'] = [commit_indices.get(sha, 9999) for sha in group['commits']]
+            if 'commit_indices' not in group:
+                group['commit_indices'] = [commit_indices.get(sha, 9999) for sha in group['commits']]
         
         return all_groups
     else:
         batch_groups = process_commit_batch(commits, api_key)
         if batch_groups:
+            # Validate that groups only contain consecutive commits
+            valid_groups = validate_consecutive_commits(batch_groups, commits)
             # Store commit indices in each group for sorting later
-            for group in batch_groups:
-                group['commit_indices'] = [commit_indices.get(sha, 9999) for sha in group['commits']]
-        return batch_groups
+            for group in valid_groups:
+                if 'commit_indices' not in group:
+                    group['commit_indices'] = [commit_indices.get(sha, 9999) for sha in group['commits']]
+            return valid_groups
+        return []
 
 def process_commit_batch(commits, api_key):
     """Process a batch of commits for logical grouping."""
@@ -164,18 +231,20 @@ def process_commit_batch(commits, api_key):
     
     prompt = f"""
 Analyze these git commits and group them logically based on what they're trying to achieve.
+IMPORTANT: Only group commits that are adjacent/consecutive in the list below.
 Each group should represent a coherent unit of work. Respect the chronological order of the commits.
 
 For each group:
 1. Generate a concise, meaningful commit message
 2. List the commit SHAs that belong in that group (preserve the original commit order)
+3. ONLY include commits that appear next to each other in the list - never group commits that are separated by other commits
 
 Format your response as JSON like this:
 {{
   "groups": [
     {{
       "message": "Add user authentication feature",
-      "commits": ["abc1234", "def5678"]
+      "commits": ["abc1234", "def5678"]  // These must be consecutive commits
     }},
     {{
       "message": "Fix pagination bugs",
