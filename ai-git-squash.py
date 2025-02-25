@@ -43,6 +43,8 @@ def parse_args():
                       help='Show what would be done without making changes')
     parser.add_argument('--logical-grouping', action='store_true', default=True,
                       help='Group commits logically based on purpose (default: True)')
+    parser.add_argument('--batch-size', type=int, default=100,
+                      help='Maximum number of commits to process in a single API call (default: 100)')
     
     return parser.parse_args()
 
@@ -59,6 +61,17 @@ def get_commit_messages(repo_path, count, source_branch=None, target_branch=None
         # For the common use case, we want to get ALL commits from the source branch
         # that would be applied to a new branch
         try:
+            # If we're doing a new root branch, we want all commits regardless of base
+            if source_branch == "main" or source_branch == "master":
+                print(f"Processing all commits from {source_branch} branch")
+                commits = list(repo.iter_commits(source_branch, max_count=count if count > 0 else None))
+                if len(commits) > 0:
+                    print(f"Found {len(commits)} commits in '{source_branch}'")
+                    if count > 0 and len(commits) > count:
+                        print(f"Limiting to {count} most recent commits as specified")
+                        commits = commits[:count]
+                return [(commit.hexsha[:7], commit.message.strip()) for commit in commits]
+            
             # Get the merge-base (common ancestor) with main/master if target_branch not specified
             base_branch = "main"
             if not repo.heads.get(base_branch):
@@ -84,7 +97,7 @@ def get_commit_messages(repo_path, count, source_branch=None, target_branch=None
         except Exception as e:
             print(f"Error finding branch history: {e}")
             print(f"Falling back to last {count} commits from '{source_branch}'")
-            commits = list(repo.iter_commits(source_branch, max_count=count))
+            commits = list(repo.iter_commits(source_branch, max_count=count if count > 0 else None))
             
         return [(commit.hexsha[:7], commit.message.strip()) for commit in commits]
     except git.InvalidGitRepositoryError:
@@ -107,6 +120,28 @@ def get_logical_commit_groups(commits, api_key):
         print("You can also create a .env file with OPENAI_API_KEY=your_api_key")
         sys.exit(1)
     
+    # For large commit sets, we need to process in batches
+    MAX_COMMITS_PER_BATCH = 100
+    all_groups = []
+    
+    if len(commits) > MAX_COMMITS_PER_BATCH:
+        print(f"\nProcessing {len(commits)} commits in batches of {MAX_COMMITS_PER_BATCH}...")
+        batches = [commits[i:i + MAX_COMMITS_PER_BATCH] for i in range(0, len(commits), MAX_COMMITS_PER_BATCH)]
+        
+        for i, batch in enumerate(batches):
+            print(f"Processing batch {i+1}/{len(batches)} ({len(batch)} commits)...")
+            batch_groups = process_commit_batch(batch, api_key)
+            if batch_groups:
+                all_groups.extend(batch_groups)
+            else:
+                print(f"Warning: Failed to process batch {i+1}, skipping...")
+        
+        return all_groups
+    else:
+        return process_commit_batch(commits, api_key)
+
+def process_commit_batch(commits, api_key):
+    """Process a batch of commits for logical grouping."""
     # Format the commits for the prompt
     commit_details = "\n".join([f"{sha}: {msg}" for sha, msg in commits])
     
@@ -137,6 +172,7 @@ Commits to analyze:
 """
     
     try:
+        print("Calling OpenAI API to analyze commits...")
         response = openai.chat.completions.create(
             model="gpt-4o",
             messages=[
@@ -144,7 +180,8 @@ Commits to analyze:
                 {"role": "user", "content": prompt}
             ],
             response_format={"type": "json_object"},
-            max_tokens=500
+            max_tokens=4000,
+            timeout=120  # 2 minute timeout for large batches
         )
         
         import json
@@ -320,6 +357,9 @@ def perform_logical_squashes(repo_path, commits, commit_groups, source_branch=No
     original_dir = os.getcwd()
     success = True
     
+    # Track timing for large operations
+    start_time = time.time()
+    
     try:
         # Change to the repo directory
         os.chdir(repo_path)
@@ -469,6 +509,12 @@ def perform_logical_squashes(repo_path, commits, commit_groups, source_branch=No
         # Go back to the original branch when done
         if original_branch != target_branch:
             subprocess.run(['git', 'checkout', original_branch], check=True)
+        
+        # Calculate and display elapsed time
+        elapsed_time = time.time() - start_time
+        minutes, seconds = divmod(elapsed_time, 60)
+        
+        print(f"\nOperation completed in {int(minutes)} minutes and {int(seconds)} seconds")
             
         # Print instructions for making this the new main branch
         if source_branch == "main" or source_branch == "master":
@@ -496,6 +542,9 @@ def main():
     """Main function."""
     args = parse_args()
     
+    # Track overall execution time
+    start_time = time.time()
+    
     # Determine branch context for display message
     if args.source_branch:
         print(f"Analyzing commits from branch '{args.source_branch}'...")
@@ -504,6 +553,12 @@ def main():
     
     if args.new_root:
         print("Creating a new branch with no shared history (--new-root mode)")
+        
+    # If processing main branch with lots of commits, give a warning
+    if (args.source_branch == "main" or args.source_branch == "master") and args.count > 1000:
+        print("\nWARNING: Processing a large number of commits from main branch.")
+        print("This operation may take a significant amount of time.")
+        print("Consider reducing the commit count with --count if it's too slow.\n")
     
     commits = get_commit_messages(args.repo, args.count, args.source_branch, args.target_branch)
     
@@ -551,7 +606,10 @@ def main():
                                              args.source_branch, args.target_branch, 
                                              args.create_target, args.new_root)
             if success:
-                print("Logical squash operation completed.")
+                # Calculate and display elapsed time
+                elapsed_time = time.time() - start_time
+                minutes, seconds = divmod(elapsed_time, 60)
+                print(f"Logical squash operation completed in {int(minutes)} minutes and {int(seconds)} seconds.")
             else:
                 print("Logical squash operation had errors.")
         else:
