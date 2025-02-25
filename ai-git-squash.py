@@ -754,6 +754,9 @@ def main():
     # Track overall execution time
     start_time = time.time()
     
+    # Initialize repo object
+    repo = git.Repo(args.repo)
+    
     # Determine branch context for display message
     if args.source_branch:
         print(f"Analyzing commits from branch '{args.source_branch}'...")
@@ -822,7 +825,7 @@ def main():
                 
                 # Verify that branches have the same content
                 if args.verify and not args.skip_verify and args.target_branch:
-                    source_branch = args.source_branch or repo.git.Repo('.').active_branch.name
+                    source_branch = args.source_branch or repo.active_branch.name
                     compare_branch_content(args.repo, source_branch, args.target_branch)
             else:
                 print("Logical squash operation had errors.")
@@ -855,7 +858,7 @@ def main():
                 
                 # Verify that branches have the same content
                 if args.verify and not args.skip_verify and args.target_branch:
-                    source_branch = args.source_branch or repo.git.Repo('.').active_branch.name
+                    source_branch = args.source_branch or repo.active_branch.name
                     compare_branch_content(args.repo, source_branch, args.target_branch)
         else:
             print("Squash operation cancelled.")
