@@ -27,25 +27,25 @@ def parse_args():
     parser = argparse.ArgumentParser(description="AI-assisted Git commit squashing")
     parser.add_argument('--repo', type=str, default='.', 
                       help='Path to the git repository (defaults to current directory)')
-    parser.add_argument('--count', type=int, default=5,
-                      help='Number of commits to consider squashing (default: 5)')
+    parser.add_argument('--count', type=int, default=0,
+                      help='Number of commits to consider squashing (default: all since branch creation)')
     parser.add_argument('--source-branch', type=str,
                       help='Source branch containing commits to squash (defaults to current branch)')
     parser.add_argument('--target-branch', type=str,
-                      help='Target branch for the squashed commit (defaults to source branch)')
-    parser.add_argument('--create-target', action='store_true',
-                      help='Create the target branch if it does not exist')
+                      help='Target branch for the squashed commit (defaults to source-branch-squashed)')
+    parser.add_argument('--create-target', action='store_true', default=True,
+                      help='Create the target branch if it does not exist (default: True)')
     parser.add_argument('--api-key', type=str, 
                       help='OpenAI API key (defaults to OPENAI_API_KEY environment variable)')
     parser.add_argument('--dry-run', action='store_true',
                       help='Show what would be done without making changes')
-    parser.add_argument('--logical-grouping', action='store_true',
-                      help='Group commits logically based on purpose instead of squashing all into one')
+    parser.add_argument('--logical-grouping', action='store_true', default=True,
+                      help='Group commits logically based on purpose (default: True)')
     
     return parser.parse_args()
 
 def get_commit_messages(repo_path, count, source_branch=None, target_branch=None):
-    """Get commit messages between branches or the last N commits from a branch."""
+    """Get commit messages from a branch."""
     try:
         repo = git.Repo(repo_path)
         
@@ -54,23 +54,34 @@ def get_commit_messages(repo_path, count, source_branch=None, target_branch=None
             source_branch = repo.active_branch.name
             print(f"Using current branch '{source_branch}' as source")
         
-        # If target branch is specified, get commits between branches
-        if target_branch:
-            try:
-                # Get commits that are in source_branch but not in target_branch
-                commits_between = list(repo.iter_commits(f"{target_branch}..{source_branch}"))
-                if not commits_between:
-                    print(f"No unique commits found in '{source_branch}' compared to '{target_branch}'")
-                    sys.exit(0)
-                
-                # Limit to the specified count if needed
-                commits = commits_between[:count] if len(commits_between) > count else commits_between
-                print(f"Found {len(commits)} commits in '{source_branch}' not in '{target_branch}'")
-            except Exception as e:
-                print(f"Error comparing branches: {e}")
-                sys.exit(1)
-        else:
-            # Just get the last N commits from the source branch
+        # For the common use case, we want to get ALL commits from the source branch
+        # that would be applied to a new branch
+        try:
+            # Get the merge-base (common ancestor) with main/master if target_branch not specified
+            base_branch = "main"
+            if not repo.heads.get(base_branch):
+                base_branch = "master"
+                if not repo.heads.get(base_branch):
+                    # If neither main nor master exists, just use the last N commits
+                    print(f"No main or master branch found, using last {count} commits from '{source_branch}'")
+                    commits = list(repo.iter_commits(source_branch, max_count=count))
+                    return [(commit.hexsha[:7], commit.message.strip()) for commit in commits]
+            
+            # Get the common ancestor
+            merge_base = repo.git.merge_base(source_branch, base_branch)
+            
+            # Get all commits from merge_base to source_branch head
+            commits = list(repo.iter_commits(f"{merge_base}..{source_branch}"))
+            
+            # If there are too many, limit to count
+            if len(commits) > count and count > 0:
+                print(f"Found {len(commits)} commits, limiting to {count} as specified")
+                commits = commits[:count]
+            else:
+                print(f"Found {len(commits)} commits in '{source_branch}' since branching from {base_branch}")
+        except Exception as e:
+            print(f"Error finding branch history: {e}")
+            print(f"Falling back to last {count} commits from '{source_branch}'")
             commits = list(repo.iter_commits(source_branch, max_count=count))
             
         return [(commit.hexsha[:7], commit.message.strip()) for commit in commits]
@@ -325,59 +336,106 @@ def perform_logical_squashes(repo_path, commits, commit_groups, source_branch=No
                 print(f"\nGroup {i+1}: {group['message']}")
                 print(f"  Commits: {', '.join(group['commits'])}")
             return True
+        
+        # Find base point for branches
+        try:
+            # First try to find the merge-base with main/master
+            base_branch = "main"
+            if not repo.heads.get(base_branch):
+                base_branch = "master"
+                if not repo.heads.get(base_branch):
+                    # If no main/master, just use the parent of the oldest commit we have
+                    oldest_commit = commits[-1][0]
+                    merge_base = repo.git.rev_parse(f"{oldest_commit}^")
+                    print(f"Using parent of oldest commit as base point: {merge_base[:7]}")
+                else:
+                    merge_base = repo.git.merge_base(source_branch, base_branch)
+                    print(f"Using merge-base with {base_branch} as starting point: {merge_base[:7]}")
+            else:
+                merge_base = repo.git.merge_base(source_branch, base_branch)
+                print(f"Using merge-base with {base_branch} as starting point: {merge_base[:7]}")
+        except Exception as e:
+            print(f"Error finding merge base: {e}")
+            if commits:
+                oldest_commit = commits[-1][0]
+                merge_base = repo.git.rev_parse(f"{oldest_commit}^")
+                print(f"Using parent of oldest commit as base point: {merge_base[:7]}")
+            else:
+                print("No commits found to determine base point.")
+                return False
             
-        # In target branch mode, we need to create a temporary branch
+        # Check/create target branch
         if target_branch:
-            # Check if target branch exists
             target_exists = target_branch in [ref.name for ref in repo.references if isinstance(ref, git.Head)]
             if not target_exists:
                 if create_target:
-                    print(f"Target branch '{target_branch}' does not exist, creating it...")
-                    # Create the target branch from the current HEAD
-                    subprocess.run(['git', 'branch', target_branch], check=True)
+                    print(f"Target branch '{target_branch}' does not exist, creating it at {merge_base[:7]}...")
+                    # Create target branch at the merge-base point
+                    subprocess.run(['git', 'checkout', '-b', target_branch, merge_base], check=True)
                 else:
                     print(f"Error: Target branch '{target_branch}' does not exist.")
                     print("Use --create-target to create it automatically.")
                     return False
-                    
-            # Create a temporary branch from the target branch
-            temp_branch = f"temp-logical-squash-{int(time.time())}"
-            subprocess.run(['git', 'checkout', target_branch], check=True)
-            subprocess.run(['git', 'checkout', '-b', temp_branch], check=True)
-            
-            # Process each group
-            for i, group in enumerate(commit_groups):
-                print(f"\nProcessing group {i+1}/{len(commit_groups)}: {group['message']}")
+            else:
+                # Use existing target branch
+                print(f"Using existing target branch: {target_branch}")
+                subprocess.run(['git', 'checkout', target_branch], check=True)
                 
-                # Cherry-pick each commit in the group
-                for commit_sha in group['commits']:
-                    try:
-                        # Find the full SHA from the short SHA
-                        matching_commits = [c for sha, c in commits if sha.startswith(commit_sha)]
-                        if not matching_commits:
-                            print(f"Warning: Could not find commit {commit_sha}, skipping")
-                            continue
-                            
-                        full_sha = repo.git.rev_parse(commit_sha)
-                        subprocess.run(['git', 'cherry-pick', '--no-commit', full_sha], check=True)
-                    except subprocess.CalledProcessError:
-                        print(f"Conflict during cherry-pick of {commit_sha}. Resolving...")
-                        # Stage all files to mark conflicts as resolved
-                        subprocess.run(['git', 'add', '.'], check=True)
+                # Ask if user wants to reset target branch to merge-base
+                if not dry_run:
+                    reset_choice = input(f"Reset '{target_branch}' to common ancestor at {merge_base[:7]}? [y/N] ").lower()
+                    if reset_choice in ('y', 'yes'):
+                        print(f"Resetting '{target_branch}' to {merge_base[:7]}")
+                        subprocess.run(['git', 'reset', '--hard', merge_base], check=True)
+        else:
+            # If no target branch specified, create a new one with a default name
+            target_branch = f"{source_branch}-squashed"
+            print(f"No target branch specified, creating '{target_branch}' at {merge_base[:7]}")
+            
+            # Check if it already exists
+            if target_branch in [ref.name for ref in repo.references if isinstance(ref, git.Head)]:
+                target_branch = f"{source_branch}-squashed-{int(time.time())}"
+                print(f"Branch already exists, using '{target_branch}' instead")
                 
-                # Create a commit for this group
-                subprocess.run(['git', 'commit', '-m', group['message']], check=True)
+            # Create the new branch
+            subprocess.run(['git', 'checkout', '-b', target_branch, merge_base], check=True)
+        
+        # Now we're on the target branch, apply the logical groups
+        for i, group in enumerate(commit_groups):
+            print(f"\nProcessing group {i+1}/{len(commit_groups)}: {group['message']}")
             
-            # Merge the temp branch into the target branch
-            subprocess.run(['git', 'checkout', target_branch], check=True)
-            subprocess.run(['git', 'merge', '--ff-only', temp_branch], check=True)
+            # Track if we've made any changes in this group
+            group_has_changes = False
             
-            # Delete the temp branch
-            subprocess.run(['git', 'branch', '-D', temp_branch], check=True)
+            # Cherry-pick each commit in the group
+            for commit_sha in group['commits']:
+                try:
+                    # Find the full SHA from the short SHA
+                    matching_commits = [c for sha, c in commits if sha.startswith(commit_sha)]
+                    if not matching_commits:
+                        print(f"Warning: Could not find commit {commit_sha}, skipping")
+                        continue
+                        
+                    full_sha = repo.git.rev_parse(commit_sha)
+                    subprocess.run(['git', 'cherry-pick', '--no-commit', full_sha], check=True)
+                    group_has_changes = True
+                except subprocess.CalledProcessError:
+                    print(f"Conflict during cherry-pick of {commit_sha}. Resolving...")
+                    # Stage all files to mark conflicts as resolved
+                    subprocess.run(['git', 'add', '.'], check=True)
+                    group_has_changes = True
             
-            # Go back to the original branch
-            if original_branch != target_branch:
-                subprocess.run(['git', 'checkout', original_branch], check=True)
+            # Create a commit for this group if we made changes
+            if group_has_changes:
+                try:
+                    subprocess.run(['git', 'commit', '-m', group['message']], check=True)
+                    print(f"Created commit for group: {group['message']}")
+                except subprocess.CalledProcessError as e:
+                    print(f"Warning: Could not create commit for group. Error: {e}")
+                    # This could happen if there were no actual changes
+                    print("Continuing to next group...")
+            else:
+                print("No changes in this group, skipping commit")
                 
         else:
             # For source branch only, process each group separately
@@ -465,10 +523,10 @@ def main():
     args = parse_args()
     
     # Determine branch context for display message
-    if args.target_branch:
-        print(f"Analyzing commits from '{args.source_branch or 'current branch'}' to '{args.target_branch}'...")
+    if args.source_branch:
+        print(f"Analyzing commits from branch '{args.source_branch}'...")
     else:
-        print(f"Analyzing the last {args.count} commits from '{args.source_branch or 'current branch'}'...")
+        print(f"Analyzing commits from current branch...")
     
     commits = get_commit_messages(args.repo, args.count, args.source_branch, args.target_branch)
     
