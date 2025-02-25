@@ -430,10 +430,35 @@ def perform_logical_squashes(repo_path, commits, commit_groups, source_branch=No
                 if create_target:
                     if new_root:
                         print(f"Creating new orphan branch '{target_branch}' with no history...")
+                        
+                        # Save the .gitignore content from source branch before switching
+                        gitignore_content = ""
+                        try:
+                            # Check if .gitignore exists in the source branch
+                            if os.path.exists(".gitignore"):
+                                with open(".gitignore", "r") as f:
+                                    gitignore_content = f.read()
+                                print("Found .gitignore in source branch, will add to new branch")
+                        except Exception as e:
+                            print(f"Warning: Could not read .gitignore: {e}")
+                        
                         # Create an orphan branch with no history
                         subprocess.run(['git', 'checkout', '--orphan', target_branch], check=True)
                         # Clean the working directory
                         subprocess.run(['git', 'rm', '-rf', '.'], check=True, stderr=subprocess.DEVNULL)
+                        
+                        # Add .gitignore as the first commit if we found one
+                        if gitignore_content:
+                            try:
+                                # Create .gitignore file
+                                with open(".gitignore", "w") as f:
+                                    f.write(gitignore_content)
+                                # Commit it
+                                subprocess.run(['git', 'add', '.gitignore'], check=True)
+                                subprocess.run(['git', 'commit', '-m', 'Add .gitignore from source branch'], check=True)
+                                print("Created initial commit with .gitignore from source branch")
+                            except Exception as e:
+                                print(f"Warning: Failed to add .gitignore: {e}")
                     else:
                         print(f"Target branch '{target_branch}' does not exist, creating it at {merge_base[:7]}...")
                         # Create target branch at the merge-base point
@@ -448,12 +473,36 @@ def perform_logical_squashes(repo_path, commits, commit_groups, source_branch=No
                 subprocess.run(['git', 'checkout', target_branch], check=True)
                     
                 if new_root:
+                    # Save the .gitignore content from source branch before switching
+                    gitignore_content = ""
+                    try:
+                        # Get .gitignore from the current branch before switching
+                        if os.path.exists(".gitignore"):
+                            with open(".gitignore", "r") as f:
+                                gitignore_content = f.read()
+                            print("Found .gitignore in source branch, will add to new branch")
+                    except Exception as e:
+                        print(f"Warning: Could not read .gitignore: {e}")
+                        
                     # For new root, we want to remove all files and history
                     subprocess.run(['git', 'checkout', '--orphan', f'temp-orphan-{int(time.time())}'], check=True)
                     subprocess.run(['git', 'rm', '-rf', '.'], check=True, stderr=subprocess.DEVNULL)
                     # Now recreate the branch
                     subprocess.run(['git', 'branch', '-D', target_branch], check=True)
                     subprocess.run(['git', 'checkout', '-b', target_branch], check=True)
+                    
+                    # Add .gitignore as the first commit if we found one
+                    if gitignore_content:
+                        try:
+                            # Create .gitignore file
+                            with open(".gitignore", "w") as f:
+                                f.write(gitignore_content)
+                            # Commit it
+                            subprocess.run(['git', 'add', '.gitignore'], check=True)
+                            subprocess.run(['git', 'commit', '-m', 'Add .gitignore from source branch'], check=True)
+                            print("Created initial commit with .gitignore from source branch")
+                        except Exception as e:
+                            print(f"Warning: Failed to add .gitignore: {e}")
                 elif not dry_run and merge_base:
                     # Ask if user wants to reset target branch to merge-base
                     reset_choice = input(f"Reset '{target_branch}' to common ancestor at {merge_base[:7]}? [y/N] ").lower()
@@ -473,10 +522,35 @@ def perform_logical_squashes(repo_path, commits, commit_groups, source_branch=No
             # Create the new branch
             if new_root:
                 print(f"Creating new orphan branch '{target_branch}' with no history...")
+                
+                # Save the .gitignore content from source branch before switching
+                gitignore_content = ""
+                try:
+                    # Check if .gitignore exists in the source branch
+                    if os.path.exists(".gitignore"):
+                        with open(".gitignore", "r") as f:
+                            gitignore_content = f.read()
+                        print("Found .gitignore in source branch, will add to new branch")
+                except Exception as e:
+                    print(f"Warning: Could not read .gitignore: {e}")
+                
                 # Create an orphan branch with no history
                 subprocess.run(['git', 'checkout', '--orphan', target_branch], check=True)
                 # Clean the working directory
                 subprocess.run(['git', 'rm', '-rf', '.'], check=True, stderr=subprocess.DEVNULL)
+                
+                # Add .gitignore as the first commit if we found one
+                if gitignore_content:
+                    try:
+                        # Create .gitignore file
+                        with open(".gitignore", "w") as f:
+                            f.write(gitignore_content)
+                        # Commit it
+                        subprocess.run(['git', 'add', '.gitignore'], check=True)
+                        subprocess.run(['git', 'commit', '-m', 'Add .gitignore from source branch'], check=True)
+                        print("Created initial commit with .gitignore from source branch")
+                    except Exception as e:
+                        print(f"Warning: Failed to add .gitignore: {e}")
             else:
                 print(f"Creating '{target_branch}' at {merge_base[:7]}")
                 subprocess.run(['git', 'checkout', '-b', target_branch, merge_base], check=True)
