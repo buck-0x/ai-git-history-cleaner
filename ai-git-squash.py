@@ -35,6 +35,8 @@ def parse_args():
                       help='Target branch for the squashed commit (defaults to source-branch-squashed)')
     parser.add_argument('--create-target', action='store_true', default=True,
                       help='Create the target branch if it does not exist (default: True)')
+    parser.add_argument('--new-root', action='store_true', default=False,
+                      help='Create a new root branch without shared history (useful for replacing main)')
     parser.add_argument('--api-key', type=str, 
                       help='OpenAI API key (defaults to OPENAI_API_KEY environment variable)')
     parser.add_argument('--dry-run', action='store_true',
@@ -313,7 +315,7 @@ def perform_squash(repo_path, count, squash_message, source_branch=None, target_
             os.chdir(original_dir)
         return False
 
-def perform_logical_squashes(repo_path, commits, commit_groups, source_branch=None, target_branch=None, create_target=False, dry_run=False):
+def perform_logical_squashes(repo_path, commits, commit_groups, source_branch=None, target_branch=None, create_target=False, new_root=False, dry_run=False):
     """Perform multiple squash operations based on logical commit groups."""
     original_dir = os.getcwd()
     success = True
@@ -339,21 +341,26 @@ def perform_logical_squashes(repo_path, commits, commit_groups, source_branch=No
         
         # Find base point for branches
         try:
-            # First try to find the merge-base with main/master
-            base_branch = "main"
-            if not repo.heads.get(base_branch):
-                base_branch = "master"
+            if new_root:
+                # Create a new orphan branch with no history
+                print("Creating a new root branch with no shared history")
+                merge_base = None
+            else:
+                # First try to find the merge-base with main/master
+                base_branch = "main"
                 if not repo.heads.get(base_branch):
-                    # If no main/master, just use the parent of the oldest commit we have
-                    oldest_commit = commits[-1][0]
-                    merge_base = repo.git.rev_parse(f"{oldest_commit}^")
-                    print(f"Using parent of oldest commit as base point: {merge_base[:7]}")
+                    base_branch = "master"
+                    if not repo.heads.get(base_branch):
+                        # If no main/master, just use the parent of the oldest commit we have
+                        oldest_commit = commits[-1][0]
+                        merge_base = repo.git.rev_parse(f"{oldest_commit}^")
+                        print(f"Using parent of oldest commit as base point: {merge_base[:7]}")
+                    else:
+                        merge_base = repo.git.merge_base(source_branch, base_branch)
+                        print(f"Using merge-base with {base_branch} as starting point: {merge_base[:7]}")
                 else:
                     merge_base = repo.git.merge_base(source_branch, base_branch)
                     print(f"Using merge-base with {base_branch} as starting point: {merge_base[:7]}")
-            else:
-                merge_base = repo.git.merge_base(source_branch, base_branch)
-                print(f"Using merge-base with {base_branch} as starting point: {merge_base[:7]}")
         except Exception as e:
             print(f"Error finding merge base: {e}")
             if commits:
@@ -369,9 +376,16 @@ def perform_logical_squashes(repo_path, commits, commit_groups, source_branch=No
             target_exists = target_branch in [ref.name for ref in repo.references if isinstance(ref, git.Head)]
             if not target_exists:
                 if create_target:
-                    print(f"Target branch '{target_branch}' does not exist, creating it at {merge_base[:7]}...")
-                    # Create target branch at the merge-base point
-                    subprocess.run(['git', 'checkout', '-b', target_branch, merge_base], check=True)
+                    if new_root:
+                        print(f"Creating new orphan branch '{target_branch}' with no history...")
+                        # Create an orphan branch with no history
+                        subprocess.run(['git', 'checkout', '--orphan', target_branch], check=True)
+                        # Clean the working directory
+                        subprocess.run(['git', 'rm', '-rf', '.'], check=True, stderr=subprocess.DEVNULL)
+                    else:
+                        print(f"Target branch '{target_branch}' does not exist, creating it at {merge_base[:7]}...")
+                        # Create target branch at the merge-base point
+                        subprocess.run(['git', 'checkout', '-b', target_branch, merge_base], check=True)
                 else:
                     print(f"Error: Target branch '{target_branch}' does not exist.")
                     print("Use --create-target to create it automatically.")
@@ -380,9 +394,16 @@ def perform_logical_squashes(repo_path, commits, commit_groups, source_branch=No
                 # Use existing target branch
                 print(f"Using existing target branch: {target_branch}")
                 subprocess.run(['git', 'checkout', target_branch], check=True)
-                
-                # Ask if user wants to reset target branch to merge-base
-                if not dry_run:
+                    
+                if new_root:
+                    # For new root, we want to remove all files and history
+                    subprocess.run(['git', 'checkout', '--orphan', f'temp-orphan-{int(time.time())}'], check=True)
+                    subprocess.run(['git', 'rm', '-rf', '.'], check=True, stderr=subprocess.DEVNULL)
+                    # Now recreate the branch
+                    subprocess.run(['git', 'branch', '-D', target_branch], check=True)
+                    subprocess.run(['git', 'checkout', '-b', target_branch], check=True)
+                elif not dry_run and merge_base:
+                    # Ask if user wants to reset target branch to merge-base
                     reset_choice = input(f"Reset '{target_branch}' to common ancestor at {merge_base[:7]}? [y/N] ").lower()
                     if reset_choice in ('y', 'yes'):
                         print(f"Resetting '{target_branch}' to {merge_base[:7]}")
@@ -390,15 +411,23 @@ def perform_logical_squashes(repo_path, commits, commit_groups, source_branch=No
         else:
             # If no target branch specified, create a new one with a default name
             target_branch = f"{source_branch}-squashed"
-            print(f"No target branch specified, creating '{target_branch}' at {merge_base[:7]}")
+            print(f"No target branch specified, creating '{target_branch}'")
             
             # Check if it already exists
             if target_branch in [ref.name for ref in repo.references if isinstance(ref, git.Head)]:
                 target_branch = f"{source_branch}-squashed-{int(time.time())}"
                 print(f"Branch already exists, using '{target_branch}' instead")
-                
+            
             # Create the new branch
-            subprocess.run(['git', 'checkout', '-b', target_branch, merge_base], check=True)
+            if new_root:
+                print(f"Creating new orphan branch '{target_branch}' with no history...")
+                # Create an orphan branch with no history
+                subprocess.run(['git', 'checkout', '--orphan', target_branch], check=True)
+                # Clean the working directory
+                subprocess.run(['git', 'rm', '-rf', '.'], check=True, stderr=subprocess.DEVNULL)
+            else:
+                print(f"Creating '{target_branch}' at {merge_base[:7]}")
+                subprocess.run(['git', 'checkout', '-b', target_branch, merge_base], check=True)
         
         # Now we're on the target branch, apply the logical groups
         for i, group in enumerate(commit_groups):
@@ -436,76 +465,21 @@ def perform_logical_squashes(repo_path, commits, commit_groups, source_branch=No
                     print("Continuing to next group...")
             else:
                 print("No changes in this group, skipping commit")
-                
-        else:
-            # For source branch only, process each group separately
-            # This is trickier as we need to use rebase interactive
+        
+        # Go back to the original branch when done
+        if original_branch != target_branch:
+            subprocess.run(['git', 'checkout', original_branch], check=True)
             
-            print("Creating a temporary script for interactive rebase...")
-            # Create a temporary script for git rebase
-            rebase_script = "#!/bin/sh\n"
-            
-            # Map original SHAs to their position in the rebase
-            sha_to_line = {}
-            all_shas = []
-            
-            # Get the commits in reverse order (oldest first)
-            for i, (sha, _) in enumerate(reversed(commits)):
-                sha_to_line[sha] = i + 1
-                all_shas.append(sha)
-            
-            # For each group
-            for group in commit_groups:
-                # Find the first and last commit in the group
-                group_shas = []
-                for short_sha in group['commits']:
-                    matching_shas = [sha for sha in all_shas if sha.startswith(short_sha)]
-                    group_shas.extend(matching_shas)
-                
-                if not group_shas:
-                    continue
-                    
-                # Pick the first commit to keep
-                first_sha = min(sha_to_line[sha] for sha in group_shas)
-                
-                # Mark remaining commits in group for squashing
-                for sha in group_shas:
-                    line_num = sha_to_line[sha]
-                    if line_num == first_sha:
-                        rebase_script += f"sed -i '{line_num}s/^pick/pick/' $1\n"
-                    else:
-                        rebase_script += f"sed -i '{line_num}s/^pick/squash/' $1\n"
-                
-                # Set the commit message for this group
-                rebase_script += f"echo '{group['message']}' > .git/COMMIT_EDITMSG\n"
-            
-            # Write the script to a temporary file
-            with open('/tmp/rebase-script.sh', 'w') as f:
-                f.write(rebase_script)
-            os.chmod('/tmp/rebase-script.sh', 0o755)
-            
-            # Make sure we're on the right branch
-            if original_branch != source_branch:
-                subprocess.run(['git', 'checkout', source_branch], check=True)
-            
-            # Start the interactive rebase with our script
-            target_commit = f"HEAD~{len(commits)}"
-            os.environ['GIT_SEQUENCE_EDITOR'] = '/tmp/rebase-script.sh'
-            
-            try:
-                subprocess.run(['git', 'rebase', '-i', target_commit], check=True)
-                print("Logical squash completed successfully!")
-            except subprocess.CalledProcessError:
-                print("Error during rebase. You may need to manually complete the rebase.")
-                success = False
-            
-            # Clean up
-            if os.path.exists('/tmp/rebase-script.sh'):
-                os.unlink('/tmp/rebase-script.sh')
-            
-            # Go back to the original branch if needed
-            if original_branch != source_branch and original_branch != repo.active_branch.name:
-                subprocess.run(['git', 'checkout', original_branch], check=True)
+        # Print instructions for making this the new main branch
+        if source_branch == "main" or source_branch == "master":
+            print("\n=== INSTRUCTIONS FOR REPLACING MAIN BRANCH ===")
+            print(f"Your new clean branch '{target_branch}' is ready.")
+            print("To use it as your new main branch, you can:")
+            print(f"1. git checkout {target_branch}")
+            print(f"2. git branch -m main main-old  # Rename old main")
+            print(f"3. git branch -m {target_branch} main  # Make your new branch the main branch")
+            print("4. git push -f origin main  # Force push the new main (USE WITH CAUTION!)")
+            print("=== END INSTRUCTIONS ===\n")
         
         # Return to original directory
         os.chdir(original_dir)
@@ -527,6 +501,9 @@ def main():
         print(f"Analyzing commits from branch '{args.source_branch}'...")
     else:
         print(f"Analyzing commits from current branch...")
+    
+    if args.new_root:
+        print("Creating a new branch with no shared history (--new-root mode)")
     
     commits = get_commit_messages(args.repo, args.count, args.source_branch, args.target_branch)
     
@@ -564,13 +541,15 @@ def main():
         if args.dry_run:
             print("\nDry run mode - no changes will be made.")
             perform_logical_squashes(args.repo, commits, commit_groups, 
-                                   args.source_branch, args.target_branch, args.create_target, dry_run=True)
+                                   args.source_branch, args.target_branch, 
+                                   args.create_target, args.new_root, dry_run=True)
             return
         
         confirm = input("\nProceed with logical squashes? [y/N] ").lower()
         if confirm in ('y', 'yes'):
             success = perform_logical_squashes(args.repo, commits, commit_groups,
-                                             args.source_branch, args.target_branch, args.create_target)
+                                             args.source_branch, args.target_branch, 
+                                             args.create_target, args.new_root)
             if success:
                 print("Logical squash operation completed.")
             else:
