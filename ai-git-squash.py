@@ -384,7 +384,8 @@ def perform_squash(repo_path, count, squash_message, source_branch=None, target_
                     subprocess.run(['git', 'cherry-pick', '--no-commit', commit], check=True)
                 except subprocess.CalledProcessError:
                     print(f"Conflict during cherry-pick of {commit[:7]}. Resolving...")
-                    # Stage all files to mark conflicts as resolved
+                    # Always choose the newer version (--theirs in cherry-pick context)
+                    subprocess.run(['git', 'checkout', '--theirs', '.'], check=True)
                     subprocess.run(['git', 'add', '.'], check=True)
             
             # Now create a single commit with our squash message
@@ -674,7 +675,9 @@ def perform_logical_squashes(repo_path, commits, commit_groups, source_branch=No
                     group_has_changes = True
                 except subprocess.CalledProcessError:
                     print(f"Conflict during cherry-pick of {commit_sha}. Resolving...")
-                    # Stage all files to mark conflicts as resolved
+                    # Always choose the newer version (--theirs in cherry-pick context)
+                    # In cherry-pick context, --theirs refers to the version being cherry-picked
+                    subprocess.run(['git', 'checkout', '--theirs', '.'], check=True)
                     subprocess.run(['git', 'add', '.'], check=True)
                     group_has_changes = True
             
