@@ -7,6 +7,7 @@ import argparse
 import os
 import sys
 import subprocess
+import time
 
 try:
     import git
@@ -27,6 +28,10 @@ def parse_args():
                       help='Path to the git repository (defaults to current directory)')
     parser.add_argument('--count', type=int, default=5,
                       help='Number of commits to consider squashing (default: 5)')
+    parser.add_argument('--source-branch', type=str,
+                      help='Source branch containing commits to squash (defaults to current branch)')
+    parser.add_argument('--target-branch', type=str,
+                      help='Target branch for the squashed commit (defaults to source branch)')
     parser.add_argument('--api-key', type=str, 
                       help='OpenAI API key (defaults to OPENAI_API_KEY environment variable)')
     parser.add_argument('--dry-run', action='store_true',
@@ -34,11 +39,35 @@ def parse_args():
     
     return parser.parse_args()
 
-def get_commit_messages(repo_path, count):
-    """Get the last N commit messages from the repository."""
+def get_commit_messages(repo_path, count, source_branch=None, target_branch=None):
+    """Get commit messages between branches or the last N commits from a branch."""
     try:
         repo = git.Repo(repo_path)
-        commits = list(repo.iter_commits('HEAD', max_count=count))
+        
+        # Get current branch if source branch not specified
+        if not source_branch:
+            source_branch = repo.active_branch.name
+            print(f"Using current branch '{source_branch}' as source")
+        
+        # If target branch is specified, get commits between branches
+        if target_branch:
+            try:
+                # Get commits that are in source_branch but not in target_branch
+                commits_between = list(repo.iter_commits(f"{target_branch}..{source_branch}"))
+                if not commits_between:
+                    print(f"No unique commits found in '{source_branch}' compared to '{target_branch}'")
+                    sys.exit(0)
+                
+                # Limit to the specified count if needed
+                commits = commits_between[:count] if len(commits_between) > count else commits_between
+                print(f"Found {len(commits)} commits in '{source_branch}' not in '{target_branch}'")
+            except Exception as e:
+                print(f"Error comparing branches: {e}")
+                sys.exit(1)
+        else:
+            # Just get the last N commits from the source branch
+            commits = list(repo.iter_commits(source_branch, max_count=count))
+            
         return [(commit.hexsha[:7], commit.message.strip()) for commit in commits]
     except git.InvalidGitRepositoryError:
         print(f"Error: {repo_path} is not a valid git repository")
@@ -85,34 +114,97 @@ Commits to squash:
         print(f"Error generating commit message with OpenAI: {e}")
         return None
 
-def perform_squash(repo_path, count, squash_message, dry_run=False):
+def perform_squash(repo_path, count, squash_message, source_branch=None, target_branch=None, dry_run=False):
     """Perform the actual git squash operation."""
     try:
-        if dry_run:
-            print(f"Would squash the last {count} commits with message:")
-            print(f"\n{squash_message}\n")
-            return True
-        
         # Change to the repo directory
         original_dir = os.getcwd()
         os.chdir(repo_path)
         
-        # Perform the squash using git commands
-        # We'll use git reset --soft to keep changes and then recommit
-        target_commit = f"HEAD~{count}"
+        # Get the repo object
+        repo = git.Repo('.')
         
-        # Get the current branch name
-        result = subprocess.run(['git', 'branch', '--show-current'], 
-                              capture_output=True, text=True, check=True)
-        current_branch = result.stdout.strip()
+        # Get current branch if source branch not specified
+        if not source_branch:
+            source_branch = repo.active_branch.name
         
-        print(f"Squashing the last {count} commits on branch '{current_branch}'...")
+        if dry_run:
+            if target_branch:
+                print(f"Would squash commits from '{source_branch}' into '{target_branch}' with message:")
+            else:
+                print(f"Would squash the last {count} commits on branch '{source_branch}' with message:")
+            print(f"\n{squash_message}\n")
+            return True
         
-        # Reset to the target commit but keep changes staged
-        subprocess.run(['git', 'reset', '--soft', target_commit], check=True)
+        # Save the current branch to return to it later if needed
+        original_branch = repo.active_branch.name
         
-        # Create a new commit with our generated message
-        subprocess.run(['git', 'commit', '-m', squash_message], check=True)
+        # If we're working with branches, we need a different approach
+        if target_branch:
+            print(f"Squashing commits from '{source_branch}' into '{target_branch}'...")
+            
+            # Create a temporary branch from the target branch
+            temp_branch = f"temp-squash-{int(time.time())}"
+            subprocess.run(['git', 'checkout', target_branch], check=True)
+            subprocess.run(['git', 'checkout', '-b', temp_branch], check=True)
+            
+            # Cherry-pick commits from source branch in reverse (oldest first)
+            # Get the commit range
+            result = subprocess.run(['git', 'rev-list', '--reverse', f"{target_branch}..{source_branch}"], 
+                                  capture_output=True, text=True, check=True)
+            commits = result.stdout.strip().split('\n')
+            
+            # Filter to respect the count parameter
+            if commits and len(commits) > count:
+                commits = commits[-count:]
+            
+            if not commits or commits[0] == '':
+                print("No commits to cherry-pick.")
+                # Clean up - go back to original branch
+                subprocess.run(['git', 'checkout', original_branch], check=True)
+                subprocess.run(['git', 'branch', '-D', temp_branch], check=True)
+                return False
+            
+            # Cherry-pick each commit
+            for commit in commits:
+                try:
+                    subprocess.run(['git', 'cherry-pick', '--no-commit', commit], check=True)
+                except subprocess.CalledProcessError:
+                    print(f"Conflict during cherry-pick of {commit[:7]}. Resolving...")
+                    # Stage all files to mark conflicts as resolved
+                    subprocess.run(['git', 'add', '.'], check=True)
+            
+            # Now create a single commit with our squash message
+            subprocess.run(['git', 'commit', '-m', squash_message], check=True)
+            
+            # Switch to target branch and merge the temp branch
+            subprocess.run(['git', 'checkout', target_branch], check=True)
+            subprocess.run(['git', 'merge', '--ff-only', temp_branch], check=True)
+            
+            # Delete the temp branch
+            subprocess.run(['git', 'branch', '-D', temp_branch], check=True)
+            
+            # Go back to the original branch if it wasn't the target branch
+            if original_branch != target_branch:
+                subprocess.run(['git', 'checkout', original_branch], check=True)
+        else:
+            # Simple case - squash commits on the current branch
+            print(f"Squashing the last {count} commits on branch '{source_branch}'...")
+            
+            # Make sure we're on the right branch
+            if original_branch != source_branch:
+                subprocess.run(['git', 'checkout', source_branch], check=True)
+            
+            # Reset to the target commit but keep changes staged
+            target_commit = f"HEAD~{count}"
+            subprocess.run(['git', 'reset', '--soft', target_commit], check=True)
+            
+            # Create a new commit with our generated message
+            subprocess.run(['git', 'commit', '-m', squash_message], check=True)
+            
+            # Go back to the original branch if needed
+            if original_branch != source_branch:
+                subprocess.run(['git', 'checkout', original_branch], check=True)
         
         print("Squash completed successfully!")
         
@@ -137,8 +229,13 @@ def main():
     """Main function."""
     args = parse_args()
     
-    print(f"Analyzing the last {args.count} commits...")
-    commits = get_commit_messages(args.repo, args.count)
+    # Determine branch context for display message
+    if args.target_branch:
+        print(f"Analyzing commits from '{args.source_branch or 'current branch'}' to '{args.target_branch}'...")
+    else:
+        print(f"Analyzing the last {args.count} commits from '{args.source_branch or 'current branch'}'...")
+    
+    commits = get_commit_messages(args.repo, args.count, args.source_branch, args.target_branch)
     
     if not commits:
         print("No commits found to squash.")
@@ -161,12 +258,14 @@ def main():
     
     if args.dry_run:
         print("Dry run mode - no changes will be made.")
-        perform_squash(args.repo, args.count, squash_message, dry_run=True)
+        perform_squash(args.repo, args.count, squash_message, 
+                     args.source_branch, args.target_branch, dry_run=True)
         return
     
     confirm = input("Proceed with squash? [y/N] ").lower()
     if confirm in ('y', 'yes'):
-        success = perform_squash(args.repo, args.count, squash_message)
+        success = perform_squash(args.repo, args.count, squash_message, 
+                               args.source_branch, args.target_branch)
         if success:
             print("Squash operation completed.")
     else:
