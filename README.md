@@ -14,18 +14,21 @@ A tool to help squash Git commits with AI assistance, providing intelligent comm
 ## Installation
 
 1. Clone the repository:
+
    ```bash
    git clone https://github.com/yourusername/ai-git-squash.git
    cd ai-git-squash
    ```
 
 2. Run the helper script which will set up a virtual environment and install dependencies:
+
    ```bash
    chmod +x run-ai-git-squash.sh
    ./run-ai-git-squash.sh --help
    ```
 
 3. Set your OpenAI API key in a `.env` file:
+
    ```bash
    cp .env.template .env
    # Edit .env with your API key
@@ -54,7 +57,7 @@ To squash commits in the current branch:
 
 ### All Options
 
-```
+```text
 --repo PATH             Path to the Git repository (defaults to current directory)
 --count NUMBER          Number of commits to consider (default: all since branch creation)
 --source-branch NAME    Source branch containing commits to squash
@@ -71,4 +74,4 @@ To squash commits in the current branch:
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE.md) file for details.
