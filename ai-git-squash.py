@@ -33,6 +33,8 @@ def parse_args():
                       help='Source branch containing commits to squash (defaults to current branch)')
     parser.add_argument('--target-branch', type=str,
                       help='Target branch for the squashed commit (defaults to source branch)')
+    parser.add_argument('--create-target', action='store_true',
+                      help='Create the target branch if it does not exist')
     parser.add_argument('--api-key', type=str, 
                       help='OpenAI API key (defaults to OPENAI_API_KEY environment variable)')
     parser.add_argument('--dry-run', action='store_true',
@@ -177,7 +179,7 @@ Commits to squash:
         print(f"Error generating commit message with OpenAI: {e}")
         return None
 
-def perform_squash(repo_path, count, squash_message, source_branch=None, target_branch=None, dry_run=False):
+def perform_squash(repo_path, count, squash_message, source_branch=None, target_branch=None, create_target=False, dry_run=False):
     """Perform the actual git squash operation."""
     try:
         # Change to the repo directory
@@ -205,6 +207,18 @@ def perform_squash(repo_path, count, squash_message, source_branch=None, target_
         # If we're working with branches, we need a different approach
         if target_branch:
             print(f"Squashing commits from '{source_branch}' into '{target_branch}'...")
+            
+            # Check if target branch exists
+            target_exists = target_branch in [ref.name for ref in repo.references if isinstance(ref, git.Head)]
+            if not target_exists:
+                if create_target:
+                    print(f"Target branch '{target_branch}' does not exist, creating it...")
+                    # Create the target branch from the current HEAD
+                    subprocess.run(['git', 'branch', target_branch], check=True)
+                else:
+                    print(f"Error: Target branch '{target_branch}' does not exist.")
+                    print("Use --create-target to create it automatically.")
+                    return False
             
             # Create a temporary branch from the target branch
             temp_branch = f"temp-squash-{int(time.time())}"
@@ -288,7 +302,7 @@ def perform_squash(repo_path, count, squash_message, source_branch=None, target_
             os.chdir(original_dir)
         return False
 
-def perform_logical_squashes(repo_path, commits, commit_groups, source_branch=None, target_branch=None, dry_run=False):
+def perform_logical_squashes(repo_path, commits, commit_groups, source_branch=None, target_branch=None, create_target=False, dry_run=False):
     """Perform multiple squash operations based on logical commit groups."""
     original_dir = os.getcwd()
     success = True
@@ -314,6 +328,18 @@ def perform_logical_squashes(repo_path, commits, commit_groups, source_branch=No
             
         # In target branch mode, we need to create a temporary branch
         if target_branch:
+            # Check if target branch exists
+            target_exists = target_branch in [ref.name for ref in repo.references if isinstance(ref, git.Head)]
+            if not target_exists:
+                if create_target:
+                    print(f"Target branch '{target_branch}' does not exist, creating it...")
+                    # Create the target branch from the current HEAD
+                    subprocess.run(['git', 'branch', target_branch], check=True)
+                else:
+                    print(f"Error: Target branch '{target_branch}' does not exist.")
+                    print("Use --create-target to create it automatically.")
+                    return False
+                    
             # Create a temporary branch from the target branch
             temp_branch = f"temp-logical-squash-{int(time.time())}"
             subprocess.run(['git', 'checkout', target_branch], check=True)
@@ -480,13 +506,13 @@ def main():
         if args.dry_run:
             print("\nDry run mode - no changes will be made.")
             perform_logical_squashes(args.repo, commits, commit_groups, 
-                                   args.source_branch, args.target_branch, dry_run=True)
+                                   args.source_branch, args.target_branch, args.create_target, dry_run=True)
             return
         
         confirm = input("\nProceed with logical squashes? [y/N] ").lower()
         if confirm in ('y', 'yes'):
             success = perform_logical_squashes(args.repo, commits, commit_groups,
-                                             args.source_branch, args.target_branch)
+                                             args.source_branch, args.target_branch, args.create_target)
             if success:
                 print("Logical squash operation completed.")
             else:
@@ -508,13 +534,13 @@ def main():
         if args.dry_run:
             print("Dry run mode - no changes will be made.")
             perform_squash(args.repo, args.count, squash_message, 
-                         args.source_branch, args.target_branch, dry_run=True)
+                         args.source_branch, args.target_branch, args.create_target, dry_run=True)
             return
         
         confirm = input("Proceed with squash? [y/N] ").lower()
         if confirm in ('y', 'yes'):
             success = perform_squash(args.repo, args.count, squash_message, 
-                                   args.source_branch, args.target_branch)
+                                   args.source_branch, args.target_branch, args.create_target)
             if success:
                 print("Squash operation completed.")
         else:
