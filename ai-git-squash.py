@@ -11,10 +11,14 @@ import subprocess
 try:
     import git
     import openai
+    from dotenv import load_dotenv
 except ImportError:
     print("Required packages not installed. Install with:")
-    print("pip install gitpython openai")
+    print("pip install gitpython openai python-dotenv")
     sys.exit(1)
+
+# Load environment variables from .env file
+load_dotenv()
 
 def parse_args():
     """Parse command line arguments."""
@@ -53,6 +57,7 @@ def generate_squash_message(commits, api_key):
     else:
         print("Error: OpenAI API key not provided")
         print("Either use --api-key or set the OPENAI_API_KEY environment variable")
+        print("You can also create a .env file with OPENAI_API_KEY=your_api_key")
         sys.exit(1)
     
     # Format the commits for the prompt
