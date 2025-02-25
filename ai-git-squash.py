@@ -288,7 +288,7 @@ def perform_squash(repo_path, count, squash_message, source_branch=None, target_
             os.chdir(original_dir)
         return False
 
-def perform_logical_squashes(repo_path, commit_groups, source_branch=None, target_branch=None, dry_run=False):
+def perform_logical_squashes(repo_path, commits, commit_groups, source_branch=None, target_branch=None, dry_run=False):
     """Perform multiple squash operations based on logical commit groups."""
     original_dir = os.getcwd()
     success = True
@@ -479,13 +479,13 @@ def main():
         
         if args.dry_run:
             print("\nDry run mode - no changes will be made.")
-            perform_logical_squashes(args.repo, commit_groups, 
+            perform_logical_squashes(args.repo, commits, commit_groups, 
                                    args.source_branch, args.target_branch, dry_run=True)
             return
         
         confirm = input("\nProceed with logical squashes? [y/N] ").lower()
         if confirm in ('y', 'yes'):
-            success = perform_logical_squashes(args.repo, commit_groups,
+            success = perform_logical_squashes(args.repo, commits, commit_groups,
                                              args.source_branch, args.target_branch)
             if success:
                 print("Logical squash operation completed.")
