@@ -73,7 +73,7 @@ Commits to squash:
     
     try:
         response = openai.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4o",
             messages=[
                 {"role": "system", "content": "You are a helpful assistant skilled in writing good git commit messages."},
                 {"role": "user", "content": prompt}
