@@ -8,6 +8,7 @@ import os
 import sys
 import subprocess
 import time
+import json
 
 try:
     import git
@@ -36,6 +37,8 @@ def parse_args():
                       help='OpenAI API key (defaults to OPENAI_API_KEY environment variable)')
     parser.add_argument('--dry-run', action='store_true',
                       help='Show what would be done without making changes')
+    parser.add_argument('--logical-grouping', action='store_true',
+                      help='Group commits logically based on purpose instead of squashing all into one')
     
     return parser.parse_args()
 
@@ -75,6 +78,66 @@ def get_commit_messages(repo_path, count, source_branch=None, target_branch=None
     except Exception as e:
         print(f"Error accessing git repository: {e}")
         sys.exit(1)
+
+def get_logical_commit_groups(commits, api_key):
+    """Group commits logically based on purpose and generate squash messages for each group."""
+    # Set up OpenAI API
+    if api_key:
+        openai.api_key = api_key
+    elif 'OPENAI_API_KEY' in os.environ:
+        openai.api_key = os.environ['OPENAI_API_KEY']
+    else:
+        print("Error: OpenAI API key not provided")
+        print("Either use --api-key or set the OPENAI_API_KEY environment variable")
+        print("You can also create a .env file with OPENAI_API_KEY=your_api_key")
+        sys.exit(1)
+    
+    # Format the commits for the prompt
+    commit_details = "\n".join([f"{sha}: {msg}" for sha, msg in commits])
+    
+    prompt = f"""
+Analyze these git commits and group them logically based on what they're trying to achieve.
+Each group should represent a coherent unit of work.
+
+For each group:
+1. Generate a concise, meaningful commit message
+2. List the commit SHAs that belong in that group
+
+Format your response as JSON like this:
+{{
+  "groups": [
+    {{
+      "message": "Add user authentication feature",
+      "commits": ["abc1234", "def5678"]
+    }},
+    {{
+      "message": "Fix pagination bugs",
+      "commits": ["ghi9012"]
+    }}
+  ]
+}}
+
+Commits to analyze:
+{commit_details}
+"""
+    
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant skilled in analyzing git commits and grouping them logically."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=500
+        )
+        
+        import json
+        result = json.loads(response.choices[0].message.content.strip())
+        return result["groups"]
+    except Exception as e:
+        print(f"Error generating logical commit groups with OpenAI: {e}")
+        return None
 
 def generate_squash_message(commits, api_key):
     """Generate a squashed commit message using OpenAI."""
@@ -225,6 +288,152 @@ def perform_squash(repo_path, count, squash_message, source_branch=None, target_
             os.chdir(original_dir)
         return False
 
+def perform_logical_squashes(repo_path, commit_groups, source_branch=None, target_branch=None, dry_run=False):
+    """Perform multiple squash operations based on logical commit groups."""
+    original_dir = os.getcwd()
+    success = True
+    
+    try:
+        # Change to the repo directory
+        os.chdir(repo_path)
+        repo = git.Repo('.')
+        
+        # Get current branch if source branch not specified
+        if not source_branch:
+            source_branch = repo.active_branch.name
+            
+        # Save the current branch to return to it later
+        original_branch = repo.active_branch.name
+        
+        if dry_run:
+            print("Dry run mode - would perform the following squashes:")
+            for i, group in enumerate(commit_groups):
+                print(f"\nGroup {i+1}: {group['message']}")
+                print(f"  Commits: {', '.join(group['commits'])}")
+            return True
+            
+        # In target branch mode, we need to create a temporary branch
+        if target_branch:
+            # Create a temporary branch from the target branch
+            temp_branch = f"temp-logical-squash-{int(time.time())}"
+            subprocess.run(['git', 'checkout', target_branch], check=True)
+            subprocess.run(['git', 'checkout', '-b', temp_branch], check=True)
+            
+            # Process each group
+            for i, group in enumerate(commit_groups):
+                print(f"\nProcessing group {i+1}/{len(commit_groups)}: {group['message']}")
+                
+                # Cherry-pick each commit in the group
+                for commit_sha in group['commits']:
+                    try:
+                        # Find the full SHA from the short SHA
+                        matching_commits = [c for sha, c in commits if sha.startswith(commit_sha)]
+                        if not matching_commits:
+                            print(f"Warning: Could not find commit {commit_sha}, skipping")
+                            continue
+                            
+                        full_sha = repo.git.rev_parse(commit_sha)
+                        subprocess.run(['git', 'cherry-pick', '--no-commit', full_sha], check=True)
+                    except subprocess.CalledProcessError:
+                        print(f"Conflict during cherry-pick of {commit_sha}. Resolving...")
+                        # Stage all files to mark conflicts as resolved
+                        subprocess.run(['git', 'add', '.'], check=True)
+                
+                # Create a commit for this group
+                subprocess.run(['git', 'commit', '-m', group['message']], check=True)
+            
+            # Merge the temp branch into the target branch
+            subprocess.run(['git', 'checkout', target_branch], check=True)
+            subprocess.run(['git', 'merge', '--ff-only', temp_branch], check=True)
+            
+            # Delete the temp branch
+            subprocess.run(['git', 'branch', '-D', temp_branch], check=True)
+            
+            # Go back to the original branch
+            if original_branch != target_branch:
+                subprocess.run(['git', 'checkout', original_branch], check=True)
+                
+        else:
+            # For source branch only, process each group separately
+            # This is trickier as we need to use rebase interactive
+            
+            print("Creating a temporary script for interactive rebase...")
+            # Create a temporary script for git rebase
+            rebase_script = "#!/bin/sh\n"
+            
+            # Map original SHAs to their position in the rebase
+            sha_to_line = {}
+            all_shas = []
+            
+            # Get the commits in reverse order (oldest first)
+            for i, (sha, _) in enumerate(reversed(commits)):
+                sha_to_line[sha] = i + 1
+                all_shas.append(sha)
+            
+            # For each group
+            for group in commit_groups:
+                # Find the first and last commit in the group
+                group_shas = []
+                for short_sha in group['commits']:
+                    matching_shas = [sha for sha in all_shas if sha.startswith(short_sha)]
+                    group_shas.extend(matching_shas)
+                
+                if not group_shas:
+                    continue
+                    
+                # Pick the first commit to keep
+                first_sha = min(sha_to_line[sha] for sha in group_shas)
+                
+                # Mark remaining commits in group for squashing
+                for sha in group_shas:
+                    line_num = sha_to_line[sha]
+                    if line_num == first_sha:
+                        rebase_script += f"sed -i '{line_num}s/^pick/pick/' $1\n"
+                    else:
+                        rebase_script += f"sed -i '{line_num}s/^pick/squash/' $1\n"
+                
+                # Set the commit message for this group
+                rebase_script += f"echo '{group['message']}' > .git/COMMIT_EDITMSG\n"
+            
+            # Write the script to a temporary file
+            with open('/tmp/rebase-script.sh', 'w') as f:
+                f.write(rebase_script)
+            os.chmod('/tmp/rebase-script.sh', 0o755)
+            
+            # Make sure we're on the right branch
+            if original_branch != source_branch:
+                subprocess.run(['git', 'checkout', source_branch], check=True)
+            
+            # Start the interactive rebase with our script
+            target_commit = f"HEAD~{len(commits)}"
+            os.environ['GIT_SEQUENCE_EDITOR'] = '/tmp/rebase-script.sh'
+            
+            try:
+                subprocess.run(['git', 'rebase', '-i', target_commit], check=True)
+                print("Logical squash completed successfully!")
+            except subprocess.CalledProcessError:
+                print("Error during rebase. You may need to manually complete the rebase.")
+                success = False
+            
+            # Clean up
+            if os.path.exists('/tmp/rebase-script.sh'):
+                os.unlink('/tmp/rebase-script.sh')
+            
+            # Go back to the original branch if needed
+            if original_branch != source_branch and original_branch != repo.active_branch.name:
+                subprocess.run(['git', 'checkout', original_branch], check=True)
+        
+        # Return to original directory
+        os.chdir(original_dir)
+        return success
+        
+    except Exception as e:
+        print(f"Error during logical squash operation: {e}")
+        # Return to original directory in case of error
+        if os.getcwd() != original_dir:
+            os.chdir(original_dir)
+        return False
+
 def main():
     """Main function."""
     args = parse_args()
@@ -247,29 +456,69 @@ def main():
         first_line = msg.split('\n')[0]
         print(f"  {sha}: {first_line}")
     
-    print("\nGenerating squashed commit message...")
-    squash_message = generate_squash_message(commits, args.api_key)
+    # Handle logical grouping mode
+    if args.logical_grouping:
+        print("\nAnalyzing commits to create logical groups...")
+        commit_groups = get_logical_commit_groups(commits, args.api_key)
+        
+        if not commit_groups:
+            print("Failed to create logical commit groups. Aborting.")
+            return
+            
+        print("\nProposed logical commit groups:")
+        for i, group in enumerate(commit_groups):
+            print(f"\nGroup {i+1}: {group['message']}")
+            print("  Commits:")
+            for commit_sha in group['commits']:
+                # Find the full commit details
+                matching = [c for sha, c in commits if sha.startswith(commit_sha)]
+                if matching:
+                    first_line = matching[0].split('\n')[0]
+                    matching_sha = next((sha for sha, _ in commits if sha.startswith(commit_sha)), commit_sha)
+                    print(f"    {matching_sha}: {first_line}")
+        
+        if args.dry_run:
+            print("\nDry run mode - no changes will be made.")
+            perform_logical_squashes(args.repo, commit_groups, 
+                                   args.source_branch, args.target_branch, dry_run=True)
+            return
+        
+        confirm = input("\nProceed with logical squashes? [y/N] ").lower()
+        if confirm in ('y', 'yes'):
+            success = perform_logical_squashes(args.repo, commit_groups,
+                                             args.source_branch, args.target_branch)
+            if success:
+                print("Logical squash operation completed.")
+            else:
+                print("Logical squash operation had errors.")
+        else:
+            print("Logical squash operation cancelled.")
     
-    if not squash_message:
-        print("Failed to generate a squash message. Aborting.")
-        return
-    
-    print(f"\nProposed squash message:\n{squash_message}\n")
-    
-    if args.dry_run:
-        print("Dry run mode - no changes will be made.")
-        perform_squash(args.repo, args.count, squash_message, 
-                     args.source_branch, args.target_branch, dry_run=True)
-        return
-    
-    confirm = input("Proceed with squash? [y/N] ").lower()
-    if confirm in ('y', 'yes'):
-        success = perform_squash(args.repo, args.count, squash_message, 
-                               args.source_branch, args.target_branch)
-        if success:
-            print("Squash operation completed.")
+    # Original single-squash mode
     else:
-        print("Squash operation cancelled.")
+        print("\nGenerating squashed commit message...")
+        squash_message = generate_squash_message(commits, args.api_key)
+        
+        if not squash_message:
+            print("Failed to generate a squash message. Aborting.")
+            return
+        
+        print(f"\nProposed squash message:\n{squash_message}\n")
+        
+        if args.dry_run:
+            print("Dry run mode - no changes will be made.")
+            perform_squash(args.repo, args.count, squash_message, 
+                         args.source_branch, args.target_branch, dry_run=True)
+            return
+        
+        confirm = input("Proceed with squash? [y/N] ").lower()
+        if confirm in ('y', 'yes'):
+            success = perform_squash(args.repo, args.count, squash_message, 
+                                   args.source_branch, args.target_branch)
+            if success:
+                print("Squash operation completed.")
+        else:
+            print("Squash operation cancelled.")
 
 if __name__ == "__main__":
     main()
