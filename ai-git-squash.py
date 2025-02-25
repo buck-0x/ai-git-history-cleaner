@@ -557,10 +557,11 @@ def perform_logical_squashes(repo_path, commits, commit_groups, source_branch=No
         
         # Now we're on the target branch, apply the logical groups in order
         
-        # Sort groups by the oldest commit in each group
+        # Sort groups by the oldest commit in each group (higher index = older commit)
         # This ensures groups are processed in chronological order
         sorted_groups = sorted(commit_groups, 
-                            key=lambda g: min(g['commit_indices']) if 'commit_indices' in g else 999)
+                            key=lambda g: max(g['commit_indices']) if 'commit_indices' in g else 0,
+                            reverse=True)
         
         for i, group in enumerate(sorted_groups):
             print(f"\nProcessing group {i+1}/{len(sorted_groups)}: {group['message']}")
@@ -571,10 +572,13 @@ def perform_logical_squashes(repo_path, commits, commit_groups, source_branch=No
             # Get the commits in this group sorted by their position in the original list
             # This ensures we apply them in chronological order (oldest first)
             if 'commit_indices' in group:
-                # Create list of (sha, index) tuples, sort by index in descending order (higher index = older commit)
-                # Remember, commits are stored newest first, so higher index = older commit
-                sorted_commits = sorted(zip(group['commits'], group['commit_indices']), 
-                                     key=lambda x: x[1], reverse=True)
+                # First reverse the commit indices so higher indices = newer commits
+                # This makes our sorting logic more intuitive
+                reversed_indices = {sha: len(commits) - idx - 1 for sha, idx in zip(group['commits'], group['commit_indices'])}
+                
+                # Sort by these reversed indices in ascending order (lower index = older commit)
+                sorted_commits = sorted(zip(group['commits'], [reversed_indices[sha] for sha in group['commits']]), 
+                                     key=lambda x: x[1])
                 sorted_shas = [sha for sha, _ in sorted_commits]
             else:
                 # Fallback if indices aren't available
