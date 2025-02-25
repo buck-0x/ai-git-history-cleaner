@@ -9,6 +9,7 @@ import sys
 import subprocess
 import time
 import json
+import difflib
 
 try:
     import git
@@ -45,6 +46,10 @@ def parse_args():
                       help='Group commits logically based on purpose (default: True)')
     parser.add_argument('--batch-size', type=int, default=100,
                       help='Maximum number of commits to process in a single API call (default: 100)')
+    parser.add_argument('--verify', action='store_true', default=True,
+                      help='Verify that source and target branches have the same content after squashing (default: True)')
+    parser.add_argument('--skip-verify', action='store_true',
+                      help='Skip verification of branch content equality')
     
     return parser.parse_args()
 
@@ -648,6 +653,100 @@ def perform_logical_squashes(repo_path, commits, commit_groups, source_branch=No
             os.chdir(original_dir)
         return False
 
+def compare_branch_content(repo_path, source_branch, target_branch):
+    """Compare the content of all files between two branches."""
+    try:
+        original_dir = os.getcwd()
+        os.chdir(repo_path)
+        repo = git.Repo('.')
+        
+        print(f"\nVerifying that '{source_branch}' and '{target_branch}' have the same content...")
+        
+        # Get the list of files in the source branch
+        subprocess.run(['git', 'checkout', source_branch], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        result = subprocess.run(['git', 'ls-files'], capture_output=True, text=True, check=True)
+        source_files = set(result.stdout.strip().split('\n'))
+        
+        # Get the list of files in the target branch
+        subprocess.run(['git', 'checkout', target_branch], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        result = subprocess.run(['git', 'ls-files'], capture_output=True, text=True, check=True)
+        target_files = set(result.stdout.strip().split('\n'))
+        
+        # Compare the file lists
+        missing_in_target = source_files - target_files
+        missing_in_source = target_files - source_files
+        common_files = source_files.intersection(target_files)
+        
+        if missing_in_target:
+            print(f"Warning: {len(missing_in_target)} files are in '{source_branch}' but missing in '{target_branch}':")
+            for file in sorted(missing_in_target):
+                print(f"  - {file}")
+        
+        if missing_in_source:
+            print(f"Warning: {len(missing_in_source)} files are in '{target_branch}' but missing in '{source_branch}':")
+            for file in sorted(missing_in_source):
+                print(f"  - {file}")
+        
+        # Compare content of common files
+        different_files = []
+        
+        print(f"Comparing content of {len(common_files)} files...")
+        for i, file in enumerate(sorted(common_files)):
+            if i % 100 == 0 and i > 0:
+                print(f"  Processed {i}/{len(common_files)} files...")
+                
+            # Get content from source branch
+            subprocess.run(['git', 'checkout', source_branch, '--', file], 
+                         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                with open(file, 'rb') as f:
+                    source_content = f.read()
+            except Exception:
+                # Skip files that can't be read
+                continue
+            
+            # Get content from target branch
+            subprocess.run(['git', 'checkout', target_branch, '--', file], 
+                         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                with open(file, 'rb') as f:
+                    target_content = f.read()
+            except Exception:
+                # Skip files that can't be read
+                continue
+            
+            # Compare content
+            if source_content != target_content:
+                different_files.append(file)
+        
+        if different_files:
+            print(f"Warning: {len(different_files)} files have different content:")
+            for file in different_files:
+                print(f"  - {file}")
+            
+            # Ask if user wants to see a detailed diff for each file
+            if len(different_files) <= 5:  # Only offer this for a small number of files
+                show_diff = input("Show detailed diff for these files? [y/N] ").lower()
+                if show_diff in ('y', 'yes'):
+                    for file in different_files:
+                        print(f"\nDiff for {file}:")
+                        subprocess.run(['git', 'diff', f"{source_branch}:{file}", f"{target_branch}:{file}"], check=True)
+            
+            print("\nThe branches have different content. This might be due to:")
+            print("  - Files that should be ignored (consider adding them to .gitignore)")
+            print("  - Logical squash changes that didn't preserve exact whitespace/formatting")
+            print("  - Cherry-picking conflicts that were auto-resolved")
+            return False
+        else:
+            print("Verification successful! Branches have identical content.")
+            return True
+    except Exception as e:
+        print(f"Error comparing branch content: {e}")
+        return False
+    finally:
+        # Restore original directory and branch
+        os.chdir(original_dir)
+
 def main():
     """Main function."""
     args = parse_args()
@@ -720,6 +819,11 @@ def main():
                 elapsed_time = time.time() - start_time
                 minutes, seconds = divmod(elapsed_time, 60)
                 print(f"Logical squash operation completed in {int(minutes)} minutes and {int(seconds)} seconds.")
+                
+                # Verify that branches have the same content
+                if args.verify and not args.skip_verify and args.target_branch:
+                    source_branch = args.source_branch or repo.git.Repo('.').active_branch.name
+                    compare_branch_content(args.repo, source_branch, args.target_branch)
             else:
                 print("Logical squash operation had errors.")
         else:
@@ -748,6 +852,11 @@ def main():
                                    args.source_branch, args.target_branch, args.create_target)
             if success:
                 print("Squash operation completed.")
+                
+                # Verify that branches have the same content
+                if args.verify and not args.skip_verify and args.target_branch:
+                    source_branch = args.source_branch or repo.git.Repo('.').active_branch.name
+                    compare_branch_content(args.repo, source_branch, args.target_branch)
         else:
             print("Squash operation cancelled.")
 
