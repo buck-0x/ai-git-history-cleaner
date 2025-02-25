@@ -120,6 +120,9 @@ def get_logical_commit_groups(commits, api_key):
         print("You can also create a .env file with OPENAI_API_KEY=your_api_key")
         sys.exit(1)
     
+    # Store commit index for later sorting (newest commit is index 0)
+    commit_indices = {sha: idx for idx, (sha, _) in enumerate(commits)}
+    
     # For large commit sets, we need to process in batches
     MAX_COMMITS_PER_BATCH = 100
     all_groups = []
@@ -136,22 +139,31 @@ def get_logical_commit_groups(commits, api_key):
             else:
                 print(f"Warning: Failed to process batch {i+1}, skipping...")
         
+        # Store commit indices in each group for sorting later
+        for group in all_groups:
+            group['commit_indices'] = [commit_indices.get(sha, 9999) for sha in group['commits']]
+        
         return all_groups
     else:
-        return process_commit_batch(commits, api_key)
+        batch_groups = process_commit_batch(commits, api_key)
+        if batch_groups:
+            # Store commit indices in each group for sorting later
+            for group in batch_groups:
+                group['commit_indices'] = [commit_indices.get(sha, 9999) for sha in group['commits']]
+        return batch_groups
 
 def process_commit_batch(commits, api_key):
     """Process a batch of commits for logical grouping."""
-    # Format the commits for the prompt
-    commit_details = "\n".join([f"{sha}: {msg}" for sha, msg in commits])
+    # Format the commits for the prompt - add an index number for reference
+    commit_details = "\n".join([f"{i+1}. {sha}: {msg}" for i, (sha, msg) in enumerate(commits)])
     
     prompt = f"""
 Analyze these git commits and group them logically based on what they're trying to achieve.
-Each group should represent a coherent unit of work.
+Each group should represent a coherent unit of work. Respect the chronological order of the commits.
 
 For each group:
 1. Generate a concise, meaningful commit message
-2. List the commit SHAs that belong in that group
+2. List the commit SHAs that belong in that group (preserve the original commit order)
 
 Format your response as JSON like this:
 {{
@@ -469,15 +481,35 @@ def perform_logical_squashes(repo_path, commits, commit_groups, source_branch=No
                 print(f"Creating '{target_branch}' at {merge_base[:7]}")
                 subprocess.run(['git', 'checkout', '-b', target_branch, merge_base], check=True)
         
-        # Now we're on the target branch, apply the logical groups
-        for i, group in enumerate(commit_groups):
-            print(f"\nProcessing group {i+1}/{len(commit_groups)}: {group['message']}")
+        # Now we're on the target branch, apply the logical groups in order
+        
+        # Sort groups by the oldest commit in each group
+        # This ensures groups are processed in chronological order
+        sorted_groups = sorted(commit_groups, 
+                            key=lambda g: min(g['commit_indices']) if 'commit_indices' in g else 999)
+        
+        for i, group in enumerate(sorted_groups):
+            print(f"\nProcessing group {i+1}/{len(sorted_groups)}: {group['message']}")
             
             # Track if we've made any changes in this group
             group_has_changes = False
             
-            # Cherry-pick each commit in the group
-            for commit_sha in group['commits']:
+            # Get the commits in this group sorted by their position in the original list
+            # This ensures we apply them in chronological order (oldest first)
+            if 'commit_indices' in group:
+                # Create list of (sha, index) tuples, sort by index in descending order (higher index = older commit)
+                # Remember, commits are stored newest first, so higher index = older commit
+                sorted_commits = sorted(zip(group['commits'], group['commit_indices']), 
+                                     key=lambda x: x[1], reverse=True)
+                sorted_shas = [sha for sha, _ in sorted_commits]
+            else:
+                # Fallback if indices aren't available
+                sorted_shas = group['commits']
+            
+            print(f"  Applying {len(sorted_shas)} commits in chronological order")
+            
+            # Cherry-pick each commit in the group in chronological order
+            for commit_sha in sorted_shas:
                 try:
                     # Find the full SHA from the short SHA
                     matching_commits = [c for sha, c in commits if sha.startswith(commit_sha)]
